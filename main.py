@@ -519,7 +519,8 @@ class GmailUnsubscriber:
                            max_emails: int = 50, dry_run: bool = True,
                            delete_after_unsubscribe: bool = False,
                            permanent_delete: bool = False,
-                           inbox_only: bool = True):
+                           inbox_only: bool = True,
+                           delete_without_unsubscribe: bool = True):
         """
         Main method to find and process unsubscribe requests
         
@@ -530,14 +531,140 @@ class GmailUnsubscriber:
             delete_after_unsubscribe: If True, delete emails after successful unsubscribe
             permanent_delete: If True, permanently delete (vs move to trash)
             inbox_only: If True, search only in inbox (default: True)
+            delete_without_unsubscribe: If True, delete emails even when no unsubscribe link is found
         """
         print(f"\n{'='*60}")
         print(f"Gmail Unsubscribe Tool - {'DRY RUN' if dry_run else 'LIVE RUN'}")
+        print(f"{'='*60}")
+        
+        # Search for emails containing unsubscribe links
+        messages = self.search_emails(search_query, max_emails, inbox_only)
+        
+        if not messages:
+            print("No messages found matching the search criteria.")
+            return
+        
+        processed_count = 0
+        success_count = 0
+        skipped_count = 0
+        
+        # Track processed senders to avoid duplicates
+        processed_senders = set()
+        sender_details = {}  # Store details for summary
+        
+        for i, msg in enumerate(messages, 1):
+            print(f"\nProcessing email {i}/{len(messages)}...")
+            
+            # Get full message details
+            message = self.get_message_details(msg['id'])
+            if not message:
+                continue
+            
+            # Get sender information
+            sender_name, sender_email = self.get_sender_info(message)
+            
+            # Check if we've already processed this sender
+            sender_key = sender_email.lower().strip()
+            if sender_key in processed_senders:
+                print(f"  ⏭️  Skipping {sender_name} - already processed this sender")
+                
+                if delete_after_unsubscribe and not dry_run:
+                    # Move email to trash since sender was already processed
+                    if permanent_delete:
+                        self.delete_messages([msg['id']], sender_name)
+                    else:
+                        self.move_to_trash([msg['id']], sender_name)
+                elif dry_run and delete_after_unsubscribe:
+                    action = "permanently delete" if permanent_delete else "move to trash"
+                    print(f"  [DRY RUN] Would {action} this email from previously processed sender")
+                
+                skipped_count += 1
+                continue
+            
+            # Extract unsubscribe links
+            unsubscribe_links = self.extract_unsubscribe_links(message)
+            
+            if not unsubscribe_links:
+                print(f"  No unsubscribe links found for {sender_name}")
+                
+                # If delete_without_unsubscribe is True and delete_after_unsubscribe is True, delete anyway
+                if delete_without_unsubscribe and delete_after_unsubscribe and not dry_run:
+                    print(f"  Deleting email without unsubscribe attempt...")
+                    if permanent_delete:
+                        self.delete_messages([msg['id']], sender_name)
+                    else:
+                        self.move_to_trash([msg['id']], sender_name)
+                elif dry_run and delete_without_unsubscribe and delete_after_unsubscribe:
+                    action = "permanently delete" if permanent_delete else "move to trash"
+                    print(f"  [DRY RUN] Would {action} email without unsubscribe attempt")
+                
+                continue
+            
+            print(f"  Found {len(unsubscribe_links)} unsubscribe link(s) for {sender_name}")
+            
+            # Add sender to processed set
+            processed_senders.add(sender_key)
+            sender_details[sender_key] = {
+                'name': sender_name,
+                'email': sender_email,
+                'links': unsubscribe_links,
+                'success': False
+            }
+            
+            if dry_run:
+                print(f"  [DRY RUN] Would attempt to unsubscribe from {sender_email}")
+                for j, link in enumerate(unsubscribe_links, 1):
+                    print(f"    Link {j}: {link}")
+                sender_details[sender_key]['success'] = True  # Assume success for dry run
+            else:
+                # Attempt to unsubscribe using the first link
+                success = self.attempt_unsubscribe(unsubscribe_links[0], (sender_name, sender_email))
+                sender_details[sender_key]['success'] = success
+                
+                if success:
+                    success_count += 1
+                
+                # Delete or trash the email regardless of unsubscribe success
+                if delete_after_unsubscribe:
+                    if permanent_delete:
+                        self.delete_messages([msg['id']], sender_name)
+                    else:
+                        self.move_to_trash([msg['id']], sender_name)
+                else:
+                    # Only label if unsubscribe was successful
+                    if success:
+                        self.label_message(msg['id'])
+            
+            processed_count += 1
+        
+        # Print detailed summary
+        print(f"\n{'='*60}")
+        print(f"DETAILED SUMMARY:")
+        print(f"{'='*60}")
+        print(f"  Total emails scanned: {len(messages)}")
+        print(f"  Unique senders processed: {processed_count}")
+        print(f"  Duplicate senders skipped: {skipped_count}")
+        
+        if not dry_run:
+            print(f"  Successful unsubscribes: {success_count}")
+            print(f"  Failed unsubscribes: {processed_count - success_count}")
+        
+        # List all processed senders
+        if sender_details:
+            print(f"\nProcessed Senders:")
+            for sender_key, details in sender_details.items():
+                status = "✓" if details['success'] else "✗"
+                mode = "[DRY RUN]" if dry_run else ""
+                print(f"  {status} {details['name']} ({details['email']}) {mode}")
+        
+        print(f"{'='*60}")
+
     def process_unsubscribes_by_sender(self, search_query: str = "unsubscribe", 
                                      max_emails: int = 50, dry_run: bool = True,
                                      delete_after_unsubscribe: bool = False,
                                      permanent_delete: bool = False,
-                                     inbox_only: bool = True):
+                                     inbox_only: bool = True,
+                                     delete_without_unsubscribe: bool = True):
         """
         Process unsubscribes grouped by sender (more efficient)
         
@@ -548,6 +675,7 @@ class GmailUnsubscriber:
             delete_after_unsubscribe: If True, delete emails after successful unsubscribe
             permanent_delete: If True, permanently delete (vs move to trash)
             inbox_only: If True, search only in inbox (default: True)
+            delete_without_unsubscribe: If True, delete emails even when no unsubscribe link is found
         """
         print(f"\n{'='*60}")
         action_mode = "DRY RUN" if dry_run else "LIVE RUN"
@@ -617,6 +745,20 @@ class GmailUnsubscriber:
             
             if not unsubscribe_links:
                 print(f"  No unsubscribe links found for {sender_name}")
+                
+                # If delete_without_unsubscribe is True and delete_after_unsubscribe is True, delete anyway
+                if delete_without_unsubscribe and delete_after_unsubscribe and not dry_run:
+                    print(f"  Deleting {email_count} emails without unsubscribe attempt...")
+                    message_ids = [msg['id'] for msg in messages_from_sender]
+                    if permanent_delete:
+                        deleted_count = self.delete_messages(message_ids, sender_name)
+                    else:
+                        deleted_count = self.move_to_trash(message_ids, sender_name)
+                    total_deleted += deleted_count
+                elif dry_run and delete_without_unsubscribe and delete_after_unsubscribe:
+                    action = "permanently delete" if permanent_delete else "move to trash"
+                    print(f"  [DRY RUN] Would {action} {email_count} emails without unsubscribe attempt")
+                
                 continue
             
             print(f"  Found {len(unsubscribe_links)} unsubscribe link(s)")
@@ -639,25 +781,26 @@ class GmailUnsubscriber:
                 
                 if success:
                     success_count += 1
-                    
-                    # Get message IDs for deletion/labeling
-                    message_ids = [msg['id'] for msg in messages_from_sender]
-                    
-                    if delete_after_unsubscribe:
-                        # Delete or trash emails
-                        if permanent_delete:
-                            deleted_count = self.delete_messages(message_ids, sender_name)
-                        else:
-                            deleted_count = self.move_to_trash(message_ids, sender_name)
-                        
-                        total_deleted += deleted_count
+                else:
+                    print(f"  Failed to unsubscribe from {sender_name}")
+                
+                # Get message IDs for deletion/labeling
+                message_ids = [msg['id'] for msg in messages_from_sender]
+                
+                if delete_after_unsubscribe:
+                    # Delete or trash emails regardless of unsubscribe success
+                    if permanent_delete:
+                        deleted_count = self.delete_messages(message_ids, sender_name)
                     else:
-                        # Label all messages from this sender
+                        deleted_count = self.move_to_trash(message_ids, sender_name)
+                    
+                    total_deleted += deleted_count
+                else:
+                    # Only label if unsubscribe was successful
+                    if success:
                         print(f"  Labeling {email_count} emails from this sender...")
                         for message in messages_from_sender:
                             self.label_message(message['id'])
-                else:
-                    print(f"  Failed to unsubscribe from {sender_name}")
         
         # Print detailed summary
         print(f"\n{'='*60}")
@@ -667,6 +810,7 @@ class GmailUnsubscriber:
         print(f"  Unique senders found: {len(sender_groups)}")
         print(f"  Senders processed: {processed_count}")
         print(f"  Total emails affected: {total_emails_affected}")
+        print(f"  Total emails deleted/trash: {total_deleted}")
         
         if not dry_run:
             print(f"  Successful unsubscribes: {success_count}")
@@ -678,107 +822,6 @@ class GmailUnsubscriber:
                 print(f"  Estimated inbox cleanup: {total_deleted} emails removed")
             else:
                 print(f"  Emails labeled: {success_count * (total_emails_affected / len(sender_groups)) if sender_groups else 0:.0f}")
-        
-        print(f"{'='*60}")
-        
-        # Search for emails containing unsubscribe links
-        messages = self.search_emails(search_query, max_emails, inbox_only)
-        
-        if not messages:
-            print("No messages found matching the search criteria.")
-            return
-        
-        processed_count = 0
-        success_count = 0
-        skipped_count = 0
-        
-        # Track processed senders to avoid duplicates
-        processed_senders = set()
-        sender_details = {}  # Store details for summary
-        
-        for i, msg in enumerate(messages, 1):
-            print(f"\nProcessing email {i}/{len(messages)}...")
-            
-            # Get full message details
-            message = self.get_message_details(msg['id'])
-            if not message:
-                continue
-            
-            # Get sender information
-            sender_name, sender_email = self.get_sender_info(message)
-            
-            # Check if we've already processed this sender
-            sender_key = sender_email.lower().strip()
-            if sender_key in processed_senders:
-                print(f"  ⏭️  Skipping {sender_name} - already processed this sender")
-                
-                if delete_after_unsubscribe and not dry_run:
-                    # Move email to trash since sender was already processed
-                    if permanent_delete:
-                        self.delete_messages([msg['id']], sender_name)
-                    else:
-                        self.move_to_trash([msg['id']], sender_name)
-                elif dry_run and delete_after_unsubscribe:
-                    action = "permanently delete" if permanent_delete else "move to trash"
-                    print(f"  [DRY RUN] Would {action} this email from previously processed sender")
-                
-                skipped_count += 1
-                continue
-            
-            # Extract unsubscribe links
-            unsubscribe_links = self.extract_unsubscribe_links(message)
-            
-            if not unsubscribe_links:
-                print(f"  No unsubscribe links found for {sender_name}")
-                continue
-            
-            print(f"  Found {len(unsubscribe_links)} unsubscribe link(s) for {sender_name}")
-            
-            # Add sender to processed set
-            processed_senders.add(sender_key)
-            sender_details[sender_key] = {
-                'name': sender_name,
-                'email': sender_email,
-                'links': unsubscribe_links,
-                'success': False
-            }
-            
-            if dry_run:
-                print(f"  [DRY RUN] Would attempt to unsubscribe from {sender_email}")
-                for j, link in enumerate(unsubscribe_links, 1):
-                    print(f"    Link {j}: {link}")
-                sender_details[sender_key]['success'] = True  # Assume success for dry run
-            else:
-                # Attempt to unsubscribe using the first link
-                success = self.attempt_unsubscribe(unsubscribe_links[0], (sender_name, sender_email))
-                sender_details[sender_key]['success'] = success
-                
-                if success:
-                    success_count += 1
-                    # Label the message as processed
-                    self.label_message(msg['id'])
-            
-            processed_count += 1
-        
-        # Print detailed summary
-        print(f"\n{'='*60}")
-        print(f"DETAILED SUMMARY:")
-        print(f"{'='*60}")
-        print(f"  Total emails scanned: {len(messages)}")
-        print(f"  Unique senders processed: {processed_count}")
-        print(f"  Duplicate senders skipped: {skipped_count}")
-        
-        if not dry_run:
-            print(f"  Successful unsubscribes: {success_count}")
-            print(f"  Failed unsubscribes: {processed_count - success_count}")
-        
-        # List all processed senders
-        if sender_details:
-            print(f"\nProcessed Senders:")
-            for sender_key, details in sender_details.items():
-                status = "✓" if details['success'] else "✗"
-                mode = "[DRY RUN]" if dry_run else ""
-                print(f"  {status} {details['name']} ({details['email']}) {mode}")
         
         print(f"{'='*60}")
 
@@ -832,13 +875,19 @@ Examples:
     deletion_group.add_argument('--keep', action='store_true', 
                                help='Keep emails and add "Unsubscribed" label (default)')
     deletion_group.add_argument('--trash', action='store_true',
-                               help='Move emails to trash after successful unsubscribe')
+                               help='Move emails to trash after unsubscribe attempt')
     deletion_group.add_argument('--delete', action='store_true',
-                               help='Permanently delete emails after successful unsubscribe')
+                               help='Permanently delete emails after unsubscribe attempt')
     
     # Search scope
     parser.add_argument('--all-folders', action='store_true',
                        help='Search all folders (default: inbox only)')
+    
+    # Delete without unsubscribe option
+    parser.add_argument('--delete-without-unsubscribe', action='store_true', default=True,
+                       help='Delete/trash emails even when no unsubscribe link is found (default: True)')
+    parser.add_argument('--no-delete-without-unsubscribe', action='store_false', dest='delete_without_unsubscribe',
+                       help='Only delete/trash emails that have unsubscribe links')
     
     # Non-interactive mode
     parser.add_argument('--yes', '-y', action='store_true',
@@ -928,7 +977,8 @@ def main():
                 dry_run=dry_run,
                 delete_after_unsubscribe=delete_after_unsubscribe,
                 permanent_delete=permanent_delete,
-                inbox_only=inbox_only
+                inbox_only=inbox_only,
+                delete_without_unsubscribe=args.delete_without_unsubscribe
             )
         else:
             unsubscriber.process_unsubscribes_by_sender(
@@ -937,7 +987,8 @@ def main():
                 dry_run=dry_run,
                 delete_after_unsubscribe=delete_after_unsubscribe,
                 permanent_delete=permanent_delete,
-                inbox_only=inbox_only
+                inbox_only=inbox_only,
+                delete_without_unsubscribe=args.delete_without_unsubscribe
             )
         
     except KeyboardInterrupt:
