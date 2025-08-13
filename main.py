@@ -9,10 +9,14 @@ import re
 import pickle
 import base64
 import requests
+import json
+import argparse
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.parse import urlparse, parse_qs
 from typing import List, Dict, Optional, Tuple
+import time
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -24,17 +28,22 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly',
           'https://www.googleapis.com/auth/gmail.modify']
 
 class GmailUnsubscriber:
-    def __init__(self, credentials_file='credentials.json', token_file='token.pickle'):
+    def __init__(self, credentials_file='credentials.json', token_file='token.pickle', 
+                 history_file='unsubscribe_history.json'):
         """
         Initialize Gmail API client
         
         Args:
             credentials_file: Path to OAuth2 credentials JSON file
             token_file: Path to store authentication tokens
+            history_file: Path to store unsubscribe history
         """
         self.service = None
         self.credentials_file = credentials_file
         self.token_file = token_file
+        self.history_file = history_file
+        self.unsubscribe_history = self.load_unsubscribe_history()
+        self.last_api_call = 0  # Rate limiting
         self.authenticate()
     
     def authenticate(self):
@@ -88,18 +97,75 @@ class GmailUnsubscriber:
         self.service = build('gmail', 'v1', credentials=creds)
         print("✓ Authenticated with Gmail API")
     
-    def search_emails(self, query: str, max_results: int = 100) -> List[Dict]:
+    def load_unsubscribe_history(self) -> Dict:
+        """Load unsubscribe history from JSON file"""
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Warning: Could not load unsubscribe history from {self.history_file}: {e}")
+                return {}
+        return {}
+    
+    def save_unsubscribe_history(self):
+        """Save unsubscribe history to JSON file"""
+        try:
+            with open(self.history_file, 'w') as f:
+                json.dump(self.unsubscribe_history, f, indent=2, default=str)
+        except IOError as e:
+            print(f"Warning: Could not save unsubscribe history to {self.history_file}: {e}")
+    
+    def add_to_unsubscribe_history(self, sender_email: str, sender_name: str, 
+                                  success: bool, unsubscribe_url: str = None):
+        """Add a sender to the unsubscribe history"""
+        sender_key = sender_email.lower().strip()
+        self.unsubscribe_history[sender_key] = {
+            'sender_name': sender_name,
+            'sender_email': sender_email,
+            'unsubscribe_attempted': True,
+            'success': success,
+            'timestamp': datetime.now().isoformat(),
+            'unsubscribe_url': unsubscribe_url
+        }
+        self.save_unsubscribe_history()
+    
+    def is_already_unsubscribed(self, sender_email: str) -> bool:
+        """Check if we've already attempted to unsubscribe from this sender"""
+        sender_key = sender_email.lower().strip()
+        return sender_key in self.unsubscribe_history
+    
+    def get_unsubscribe_record(self, sender_email: str) -> Optional[Dict]:
+        """Get the unsubscribe record for a sender"""
+        sender_key = sender_email.lower().strip()
+        return self.unsubscribe_history.get(sender_key)
+    
+    def rate_limit_api_call(self, min_delay: float = 0.1):
+        """Ensure minimum delay between API calls to prevent throttling"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_api_call
+        if time_since_last < min_delay:
+            sleep_time = min_delay - time_since_last
+            time.sleep(sleep_time)
+        self.last_api_call = time.time()
+    
+    def search_emails(self, query: str, max_results: int = 100, inbox_only: bool = True) -> List[Dict]:
         """
         Search for emails matching the query
         
         Args:
             query: Gmail search query
             max_results: Maximum number of emails to return
+            inbox_only: If True, search only in inbox (default: True)
             
         Returns:
             List of email message dictionaries
         """
         try:
+            # Add inbox filter to query if inbox_only is True
+            if inbox_only and "in:inbox" not in query.lower():
+                query = f"in:inbox {query}"
+            
             results = self.service.users().messages().list(
                 userId='me', q=query, maxResults=max_results).execute()
             
@@ -114,6 +180,7 @@ class GmailUnsubscriber:
     def get_message_details(self, message_id: str) -> Optional[Dict]:
         """Get full message details including headers and body"""
         try:
+            self.rate_limit_api_call()
             message = self.service.users().messages().get(
                 userId='me', id=message_id, format='full').execute()
             return message
@@ -215,40 +282,74 @@ class GmailUnsubscriber:
         
         return sender_name, sender_email
     
-    def attempt_unsubscribe(self, url: str, sender_info: Tuple[str, str]) -> bool:
+    def attempt_unsubscribe(self, url: str, sender_info: Tuple[str, str], max_retries: int = 2) -> bool:
         """
-        Attempt to unsubscribe via HTTP request
+        Attempt to unsubscribe via HTTP request with retry logic
         
         Args:
             url: Unsubscribe URL
             sender_info: Tuple of (sender_name, sender_email)
+            max_retries: Maximum number of retry attempts
             
         Returns:
             True if successful, False otherwise
         """
         sender_name, sender_email = sender_info
         
-        try:
-            # Make GET request to unsubscribe URL
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            print(f"  Attempting unsubscribe from {sender_name} ({sender_email})")
-            print(f"  URL: {url}")
-            
-            response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
-            
-            if response.status_code == 200:
-                print(f"  ✓ Successfully accessed unsubscribe page")
-                return True
-            else:
-                print(f"  ✗ HTTP {response.status_code} - Failed to access unsubscribe page")
-                return False
+        for attempt in range(max_retries + 1):
+            try:
+                # Make GET request to unsubscribe URL
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Connection': 'close'  # Prevent connection pooling issues
+                }
                 
-        except requests.exceptions.RequestException as e:
-            print(f"  ✗ Request failed: {e}")
-            return False
+                if attempt == 0:
+                    print(f"  Attempting unsubscribe from {sender_name} ({sender_email})")
+                    print(f"  URL: {url}")
+                else:
+                    print(f"  Retry attempt {attempt}/{max_retries}")
+                
+                # Add small delay between retries
+                if attempt > 0:
+                    time.sleep(1 * attempt)
+                
+                response = requests.get(
+                    url, 
+                    headers=headers, 
+                    timeout=15, 
+                    allow_redirects=True,
+                    stream=False  # Don't stream to avoid connection issues
+                )
+                
+                if response.status_code == 200:
+                    print(f"  ✓ Successfully accessed unsubscribe page")
+                    response.close()  # Explicitly close the response
+                    return True
+                else:
+                    print(f"  ✗ HTTP {response.status_code} - Failed to access unsubscribe page")
+                    response.close()
+                    if attempt < max_retries:
+                        print(f"    Will retry...")
+                    
+            except requests.exceptions.Timeout as e:
+                print(f"  ✗ Request timeout (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                if attempt == max_retries:
+                    return False
+            except requests.exceptions.ConnectionError as e:
+                print(f"  ✗ Connection error (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                if attempt == max_retries:
+                    return False
+            except requests.exceptions.RequestException as e:
+                print(f"  ✗ Request failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                if attempt == max_retries:
+                    return False
+            except Exception as e:
+                print(f"  ✗ Unexpected error (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                if attempt == max_retries:
+                    return False
+        
+        return False
     
     def group_emails_by_sender(self, messages: List[Dict]) -> Dict[str, List[Dict]]:
         """
@@ -264,13 +365,17 @@ class GmailUnsubscriber:
         
         print("Grouping emails by sender...")
         
-        for msg in messages:
+        for i, msg in enumerate(messages, 1):
+            print(f"  Processing email {i}/{len(messages)}...")
             message = self.get_message_details(msg['id'])
             if not message:
+                print(f"    Failed to get message details for email {i}")
                 continue
                 
             sender_name, sender_email = self.get_sender_info(message)
             sender_key = sender_email.lower().strip()
+            
+            print(f"    Grouping email from: {sender_name} ({sender_email})")
             
             if sender_key not in sender_groups:
                 sender_groups[sender_key] = {
@@ -278,6 +383,9 @@ class GmailUnsubscriber:
                     'email': sender_email,
                     'messages': []
                 }
+                print(f"    Created new group for sender: {sender_email}")
+            else:
+                print(f"    Added to existing group for: {sender_email} (total: {len(sender_groups[sender_key]['messages']) + 1} emails)")
             
             sender_groups[sender_key]['messages'].append(message)
         
@@ -350,6 +458,7 @@ class GmailUnsubscriber:
             
             for i, message_id in enumerate(message_ids, 1):
                 try:
+                    self.rate_limit_api_call()
                     self.service.users().messages().delete(userId='me', id=message_id).execute()
                     deleted_count += 1
                     
@@ -388,6 +497,7 @@ class GmailUnsubscriber:
             
             for i, message_id in enumerate(message_ids, 1):
                 try:
+                    self.rate_limit_api_call()
                     self.service.users().messages().trash(userId='me', id=message_id).execute()
                     trashed_count += 1
                     
@@ -406,7 +516,10 @@ class GmailUnsubscriber:
         return trashed_count
     
     def process_unsubscribes(self, search_query: str = "unsubscribe", 
-                           max_emails: int = 50, dry_run: bool = True):
+                           max_emails: int = 50, dry_run: bool = True,
+                           delete_after_unsubscribe: bool = False,
+                           permanent_delete: bool = False,
+                           inbox_only: bool = True):
         """
         Main method to find and process unsubscribe requests
         
@@ -414,13 +527,17 @@ class GmailUnsubscriber:
             search_query: Gmail search query to find emails
             max_emails: Maximum number of emails to process
             dry_run: If True, only show what would be done without taking action
+            delete_after_unsubscribe: If True, delete emails after successful unsubscribe
+            permanent_delete: If True, permanently delete (vs move to trash)
+            inbox_only: If True, search only in inbox (default: True)
         """
         print(f"\n{'='*60}")
         print(f"Gmail Unsubscribe Tool - {'DRY RUN' if dry_run else 'LIVE RUN'}")
     def process_unsubscribes_by_sender(self, search_query: str = "unsubscribe", 
                                      max_emails: int = 50, dry_run: bool = True,
                                      delete_after_unsubscribe: bool = False,
-                                     permanent_delete: bool = False):
+                                     permanent_delete: bool = False,
+                                     inbox_only: bool = True):
         """
         Process unsubscribes grouped by sender (more efficient)
         
@@ -430,6 +547,7 @@ class GmailUnsubscriber:
             dry_run: If True, only show what would be done without taking action
             delete_after_unsubscribe: If True, delete emails after successful unsubscribe
             permanent_delete: If True, permanently delete (vs move to trash)
+            inbox_only: If True, search only in inbox (default: True)
         """
         print(f"\n{'='*60}")
         action_mode = "DRY RUN" if dry_run else "LIVE RUN"
@@ -440,7 +558,7 @@ class GmailUnsubscriber:
         print(f"{'='*60}")
         
         # Search for emails containing unsubscribe links
-        messages = self.search_emails(search_query, max_emails)
+        messages = self.search_emails(search_query, max_emails, inbox_only)
         
         if not messages:
             print("No messages found matching the search criteria.")
@@ -466,6 +584,33 @@ class GmailUnsubscriber:
             print(f"\nProcessing sender {processed_count}/{len(sender_groups)}: {sender_name}")
             print(f"  Email count: {email_count}")
             
+            # Check if we've already attempted to unsubscribe from this sender
+            if self.is_already_unsubscribed(sender_email):
+                unsubscribe_record = self.get_unsubscribe_record(sender_email)
+                print(f"  📝 Previously attempted unsubscribe on {unsubscribe_record['timestamp'][:10]}")
+                print(f"     Status: {'Success' if unsubscribe_record['success'] else 'Failed'}")
+                
+                if delete_after_unsubscribe and not dry_run:
+                    # Skip unsubscribe attempt, just delete/trash the emails
+                    message_ids = [msg['id'] for msg in messages_from_sender]
+                    print(f"  🗑️  Skipping unsubscribe (already attempted), proceeding to delete emails...")
+                    
+                    if permanent_delete:
+                        deleted_count = self.delete_messages(message_ids, sender_name)
+                    else:
+                        deleted_count = self.move_to_trash(message_ids, sender_name)
+                    
+                    total_deleted += deleted_count
+                elif dry_run:
+                    print(f"  [DRY RUN] Would skip unsubscribe (already attempted)")
+                    if delete_after_unsubscribe:
+                        action = "permanently delete" if permanent_delete else "move to trash"
+                        print(f"  [DRY RUN] Would {action} {email_count} emails without re-attempting unsubscribe")
+                else:
+                    print(f"  ⏭️  Skipping (already attempted unsubscribe, no deletion requested)")
+                
+                continue
+            
             # Use the most recent email to find unsubscribe links
             latest_message = messages_from_sender[0]  # They're already sorted by recency in Gmail API
             unsubscribe_links = self.extract_unsubscribe_links(latest_message)
@@ -487,6 +632,10 @@ class GmailUnsubscriber:
             else:
                 # Attempt to unsubscribe using the first link
                 success = self.attempt_unsubscribe(unsubscribe_links[0], (sender_name, sender_email))
+                
+                # Record the unsubscribe attempt in history
+                self.add_to_unsubscribe_history(sender_email, sender_name, success, unsubscribe_links[0])
+                print(f"  📝 Recorded unsubscribe attempt in history")
                 
                 if success:
                     success_count += 1
@@ -533,7 +682,7 @@ class GmailUnsubscriber:
         print(f"{'='*60}")
         
         # Search for emails containing unsubscribe links
-        messages = self.search_emails(search_query, max_emails)
+        messages = self.search_emails(search_query, max_emails, inbox_only)
         
         if not messages:
             print("No messages found matching the search criteria.")
@@ -562,6 +711,17 @@ class GmailUnsubscriber:
             sender_key = sender_email.lower().strip()
             if sender_key in processed_senders:
                 print(f"  ⏭️  Skipping {sender_name} - already processed this sender")
+                
+                if delete_after_unsubscribe and not dry_run:
+                    # Move email to trash since sender was already processed
+                    if permanent_delete:
+                        self.delete_messages([msg['id']], sender_name)
+                    else:
+                        self.move_to_trash([msg['id']], sender_name)
+                elif dry_run and delete_after_unsubscribe:
+                    action = "permanently delete" if permanent_delete else "move to trash"
+                    print(f"  [DRY RUN] Would {action} this email from previously processed sender")
+                
                 skipped_count += 1
                 continue
             
@@ -623,130 +783,170 @@ class GmailUnsubscriber:
         print(f"{'='*60}")
 
 
+def setup_argument_parser():
+    """Set up command-line argument parser"""
+    parser = argparse.ArgumentParser(
+        description='Gmail Unsubscribe Tool - Automatically find and process unsubscribe links',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode (default)
+  python main.py
+  
+  # Dry run with default settings
+  python main.py --dry-run
+  
+  # Live run: unsubscribe + trash emails, search newsletters, max 100 emails
+  python main.py --live --trash --query newsletter --max-emails 100
+  
+  # Live run: unsubscribe + permanently delete, group by sender
+  python main.py --live --delete --method 2 --query promotional
+  
+  # Dry run: preview what would happen with custom query
+  python main.py --dry-run --query "unsubscribe OR newsletter" --max-emails 50
+        """)
+    
+    # Mode selection
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--dry-run', '--preview', action='store_true', 
+                           help='Preview what would be done without taking action (default)')
+    mode_group.add_argument('--live', action='store_true',
+                           help='Actually perform unsubscribe and deletion actions')
+    
+    # Search options
+    query_group = parser.add_mutually_exclusive_group()
+    query_group.add_argument('--query', '-q', type=str, default='unsubscribe',
+                            choices=['unsubscribe', 'newsletter', 'promotional', 'list-unsubscribe'],
+                            help='Predefined Gmail search query (default: unsubscribe)')
+    query_group.add_argument('--custom-query', type=str, 
+                            help='Custom Gmail search query (overrides --query)')
+    parser.add_argument('--max-emails', '-m', type=int, default=100,
+                       help='Maximum number of emails to process (default: 100)')
+    
+    # Processing method
+    parser.add_argument('--method', type=int, choices=[1, 2], default=2,
+                       help='Processing method: 1=individual emails, 2=group by sender (default: 2)')
+    
+    # Deletion options
+    deletion_group = parser.add_mutually_exclusive_group()
+    deletion_group.add_argument('--keep', action='store_true', 
+                               help='Keep emails and add "Unsubscribed" label (default)')
+    deletion_group.add_argument('--trash', action='store_true',
+                               help='Move emails to trash after successful unsubscribe')
+    deletion_group.add_argument('--delete', action='store_true',
+                               help='Permanently delete emails after successful unsubscribe')
+    
+    # Search scope
+    parser.add_argument('--all-folders', action='store_true',
+                       help='Search all folders (default: inbox only)')
+    
+    # Non-interactive mode
+    parser.add_argument('--yes', '-y', action='store_true',
+                       help='Answer yes to all prompts (non-interactive mode)')
+    
+    # Verbose output
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output')
+    
+    return parser
+
+
 def main():
-    """Main function with example usage"""
+    """Main function with command-line argument support"""
+    parser = setup_argument_parser()
+    args = parser.parse_args()
+    
     try:
         # Initialize the unsubscriber
         unsubscriber = GmailUnsubscriber()
         
-        # Example searches - customize these based on your needs
-        search_queries = [
-            "unsubscribe",  # General search for emails with unsubscribe
-            "newsletter",   # Newsletter emails
-            "promotional",  # Promotional emails
-            "list-unsubscribe", # Emails with List-Unsubscribe header
-        ]
-        
-        print("Gmail Unsubscribe Tool")
-        print("=" * 40)
-        
-        # Ask user which mode to run in
-        print("\nSelect mode:")
-        print("1. Dry run (preview only)")
-        print("2. Live run (actually unsubscribe)")
-        choice = input("Enter choice (1 or 2): ").strip()
-        
-        dry_run = choice != "2"
-        
-        if dry_run:
-            print("\n⚠️  Running in DRY RUN mode - no actual unsubscriptions will be performed")
+        # Determine run mode
+        if args.live:
+            dry_run = False
         else:
-            confirm = input("\n⚠️  This will attempt to unsubscribe from mailing lists. Continue? (yes/no): ")
+            dry_run = True  # Default to dry run if neither --live nor --dry-run specified
+        
+        # Determine search query
+        if args.custom_query:
+            search_query = args.custom_query
+        else:
+            search_query = args.query
+        
+        # Determine deletion behavior
+        delete_after_unsubscribe = False
+        permanent_delete = False
+        
+        if args.trash:
+            delete_after_unsubscribe = True
+            permanent_delete = False
+        elif args.delete:
+            delete_after_unsubscribe = True
+            permanent_delete = True
+        # Default is keep (args.keep or none specified)
+        
+        # Determine search scope
+        inbox_only = not args.all_folders
+        
+        # If not in non-interactive mode and doing a live run, ask for confirmation
+        if not dry_run and not args.yes:
+            if delete_after_unsubscribe:
+                action = "permanently delete" if permanent_delete else "move to trash"
+                print(f"⚠️  This will attempt to unsubscribe AND {action} emails.")
+            else:
+                print("⚠️  This will attempt to unsubscribe from mailing lists.")
+            
+            confirm = input("Continue? (yes/no): ")
             if confirm.lower() != 'yes':
                 print("Cancelled.")
                 return
         
-        # Ask about deletion
-        delete_after_unsubscribe = False
-        permanent_delete = False
+        # Print configuration summary
+        print(f"\nGmail Unsubscribe Tool")
+        print("=" * 40)
+        print(f"Mode: {'LIVE RUN' if not dry_run else 'DRY RUN'}")
+        print(f"Search query: {search_query}")
+        print(f"Max emails: {args.max_emails}")
+        print(f"Processing method: {'Individual emails' if args.method == 1 else 'Group by sender'}")
+        print(f"Search scope: {'All folders' if not inbox_only else 'Inbox only'}")
         
-        if not dry_run:
-            print("\nWhat to do with emails after successful unsubscribe:")
-            print("1. Keep emails and add 'Unsubscribed' label (default)")
-            print("2. Move emails to trash (recoverable)")
-            print("3. Permanently delete emails (not recoverable)")
-            
-            delete_choice = input("Enter choice (1-3, default 1): ").strip() or "1"
-            
-            if delete_choice == "2":
-                delete_after_unsubscribe = True
-                permanent_delete = False
-                confirm_delete = input("⚠️  This will move emails to trash after unsubscribing. Continue? (yes/no): ")
-                if confirm_delete.lower() != 'yes':
-                    print("Cancelled.")
-                    return
-            elif delete_choice == "3":
-                delete_after_unsubscribe = True
-                permanent_delete = True
-                confirm_delete = input("⚠️  This will PERMANENTLY DELETE emails after unsubscribing. This cannot be undone! Continue? (yes/no): ")
-                if confirm_delete.lower() != 'yes':
-                    print("Cancelled.")
-                    return
+        if delete_after_unsubscribe:
+            action = "Permanently delete" if permanent_delete else "Move to trash"
+            print(f"After unsubscribe: {action} emails")
         else:
-            # For dry run, ask what they want to preview
-            print("\nDry run options:")
-            print("1. Preview unsubscribe + keep emails")
-            print("2. Preview unsubscribe + trash emails")
-            print("3. Preview unsubscribe + delete emails")
-            
-            delete_choice = input("Enter choice (1-3, default 1): ").strip() or "1"
-            if delete_choice == "2":
-                delete_after_unsubscribe = True
-                permanent_delete = False
-            elif delete_choice == "3":
-                delete_after_unsubscribe = True
-                permanent_delete = True
+            print("After unsubscribe: Keep emails and add label")
         
-        # Let user choose processing method
-        print("\nSelect processing method:")
-        print("1. Process each email individually")
-        print("2. Group by sender (recommended - avoids duplicates)")
-        method_choice = input("Enter choice (1 or 2, default 2): ").strip() or "2"
+        if args.verbose:
+            print(f"Verbose mode: Enabled")
         
-        # Let user choose search query
-        print("\nSelect search query:")
-        for i, query in enumerate(search_queries, 1):
-            print(f"{i}. {query}")
-        print("5. Custom query")
-        
-        query_choice = input("Enter choice (1-5): ").strip()
-        
-        if query_choice == "5":
-            search_query = input("Enter custom Gmail search query: ").strip()
-        else:
-            try:
-                search_query = search_queries[int(query_choice) - 1]
-            except (ValueError, IndexError):
-                search_query = "unsubscribe"
-        
-        # Get number of emails to process
-        try:
-            max_emails = int(input("Maximum emails to process (default 100): ") or "100")
-        except ValueError:
-            max_emails = 100
+        print("=" * 40)
         
         # Process unsubscribes using chosen method
-        if method_choice == "1":
+        if args.method == 1:
             unsubscriber.process_unsubscribes(
                 search_query=search_query,
-                max_emails=max_emails,
+                max_emails=args.max_emails,
                 dry_run=dry_run,
                 delete_after_unsubscribe=delete_after_unsubscribe,
-                permanent_delete=permanent_delete
+                permanent_delete=permanent_delete,
+                inbox_only=inbox_only
             )
         else:
             unsubscriber.process_unsubscribes_by_sender(
                 search_query=search_query,
-                max_emails=max_emails,
+                max_emails=args.max_emails,
                 dry_run=dry_run,
                 delete_after_unsubscribe=delete_after_unsubscribe,
-                permanent_delete=permanent_delete
+                permanent_delete=permanent_delete,
+                inbox_only=inbox_only
             )
         
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
     except Exception as e:
         print(f"Error: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
