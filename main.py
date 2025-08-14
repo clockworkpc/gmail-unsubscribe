@@ -156,25 +156,66 @@ class GmailUnsubscriber:
         Args:
             query: Gmail search query
             max_results: Maximum number of emails to return
-            inbox_only: If True, search only in inbox (default: True)
+            inbox_only: If True, search inbox-like locations including tabs (default: True)
             
         Returns:
             List of email message dictionaries
         """
         try:
-            # Add inbox filter to query if inbox_only is True
-            if inbox_only and "in:inbox" not in query.lower():
-                query = f"in:inbox {query}"
+            all_messages = []
             
-            results = self.service.users().messages().list(
-                userId='me', q=query, maxResults=max_results).execute()
+            if inbox_only and "in:" not in query.lower():
+                # Search across all inbox-like locations to match web UI behavior
+                inbox_locations = ['in:inbox', 'in:primary', 'in:social', 'in:promotions', 'in:updates']
+                
+                print(f"🔍 Searching inbox categories for: '{query}'")
+                print(f"📊 Max results per category: {max_results}")
+                
+                for location in inbox_locations:
+                    location_query = f"{location} {query}"
+                    print(f"  Searching {location}...")
+                    
+                    try:
+                        results = self.service.users().messages().list(
+                            userId='me', q=location_query, maxResults=max_results//len(inbox_locations) + 10).execute()
+                        
+                        messages = results.get('messages', [])
+                        if messages:
+                            print(f"    ✅ Found {len(messages)} emails in {location}")
+                            all_messages.extend(messages)
+                        else:
+                            print(f"    📭 No emails in {location}")
+                            
+                    except Exception as e:
+                        print(f"    ⚠️  Error searching {location}: {e}")
+                
+                # Remove duplicates based on message ID
+                unique_messages = []
+                seen_ids = set()
+                for msg in all_messages:
+                    if msg['id'] not in seen_ids:
+                        unique_messages.append(msg)
+                        seen_ids.add(msg['id'])
+                
+                messages = unique_messages[:max_results]
+                print(f"Found {len(messages)} total unique emails across inbox categories")
+                
+            else:
+                # Use original query as-is
+                print(f"🔍 Searching with query: '{query}'")
+                print(f"📊 Max results: {max_results}")
+                
+                results = self.service.users().messages().list(
+                    userId='me', q=query, maxResults=max_results).execute()
+                
+                messages = results.get('messages', [])
+                print(f"Found {len(messages)} emails matching query: {query}")
             
-            messages = results.get('messages', [])
-            print(f"Found {len(messages)} emails matching query: {query}")
             return messages
             
         except Exception as e:
             print(f"Error searching emails: {e}")
+            print(f"Exception details: {type(e).__name__}: {str(e)}")
             return []
     
     def get_message_details(self, message_id: str) -> Optional[Dict]:
